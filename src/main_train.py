@@ -13,7 +13,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from src.sketchy_dataset import PKBatchSampler, TrainDataset, ValidDataset
+from src.sketchy_dataset import TrainDataset, ValidDataset
 from src.model import ZS_SBIR
 from src.utils import get_all_categories
 
@@ -41,31 +41,7 @@ def get_datasets(opts, subset_ratio=0.2):
         val_indices = random.sample(range(len(val_photo)), val_size)
         val_photo = Subset(val_photo, val_indices)
 
-
-    if getattr(opts, 'fg_sbir', True):
-        if opts.instances_per_class <= 0:
-            if opts.batch_size % opts.classes_per_batch != 0:
-                raise ValueError(
-                    'For PK sampling, batch_size must be divisible by classes_per_batch '
-                    'when instances_per_class is not set.'
-                )
-            opts.instances_per_class = opts.batch_size // opts.classes_per_batch
-
-        expected_batch_size = opts.classes_per_batch * opts.instances_per_class
-        if expected_batch_size != opts.batch_size:
-            raise ValueError(
-                f'batch_size ({opts.batch_size}) must equal '
-                f'classes_per_batch x instances_per_class ({expected_batch_size}) for PK sampling.'
-            )
-
-        train_batch_sampler = PKBatchSampler(
-            train_dataset,
-            classes_per_batch=opts.classes_per_batch,
-            instances_per_class=opts.instances_per_class,
-        )
-        train_loader = DataLoader(dataset=train_dataset, batch_sampler=train_batch_sampler, num_workers=opts.workers)
-    else:
-        train_loader = DataLoader(dataset=train_dataset, batch_size=opts.batch_size, num_workers=opts.workers, shuffle=True)
+    train_loader = DataLoader(dataset=train_dataset, batch_size=opts.batch_size, num_workers=opts.workers, shuffle=True)
     val_sketch_loader = DataLoader(dataset=val_sketch, batch_size=opts.test_batch_size, num_workers=opts.workers, shuffle=False)
     val_photo_loader = DataLoader(dataset=val_photo, batch_size=opts.test_batch_size, num_workers=opts.workers, shuffle=False)
 
@@ -91,12 +67,10 @@ if __name__ == "__main__":
     parser.add_argument("--w_distill", type=float, default=0.1, help="loss weight for distillation")
     parser.add_argument("--w_ce", type=float, default=1.0, help="loss weight for (ce_photo + ce_sketch)")
     parser.add_argument("--w_mcc", type=float, default=0.1, help="loss weight for MCC")
-    parser.add_argument("--triplet_margin", type=float, default=0.3, help="margin for batch-hard triplet loss")
+    parser.add_argument("--triplet_margin", type=float, default=0.3, help="margin for triplet loss")
     
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--classes_per_batch', type=int, default=8, help='number of categories per PK batch')
-    parser.add_argument('--instances_per_class', type=int, default=0, help='number of instances per category in PK batch; 0 means derive from batch_size')
     parser.add_argument('--test_batch_size', type=int, default=1024)
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--workers', type=int, default=2)
