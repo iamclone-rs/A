@@ -1,0 +1,3 @@
+torchmetrics
+pytorch-lightning
+ftfy
