@@ -189,30 +189,37 @@ class ValidDataset(torch.utils.data.Dataset):
         self.mode = mode
         self.transform = normal_transform()
         _, valid_records = _get_split_records(self.args)
+        self.all_categories = _list_categories(self.args.root)
+        self.category_to_idx = {category: idx for idx, category in enumerate(self.all_categories)}
 
         if not valid_records:
             raise RuntimeError('Validation split is empty. Increase dataset size or adjust val_ratio.')
 
-        instance_to_idx = {
-            record['instance_id']: idx for idx, record in enumerate(valid_records)
-        }
-
         self.samples = []
         if self.mode == 'photo':
             for record in valid_records:
-                self.samples.append((record['photo_path'], instance_to_idx[record['instance_id']]))
+                photo_name = _photo_instance_id(record['photo_path'])
+                self.samples.append((
+                    record['photo_path'],
+                    self.category_to_idx[record['category']],
+                    photo_name,
+                ))
         else:
             for record in valid_records:
-                instance_idx = instance_to_idx[record['instance_id']]
                 for sketch_path in record['sketch_paths']:
-                    self.samples.append((sketch_path, instance_idx))
+                    sketch_name = os.path.basename(sketch_path)
+                    self.samples.append((
+                        sketch_path,
+                        self.category_to_idx[record['category']],
+                        sketch_name,
+                    ))
 
     def __getitem__(self, index):
-        filepath, instance_idx = self.samples[index]
+        filepath, category_idx, instance_name = self.samples[index]
         image = _load_padded_image(filepath, self.args.max_size)
         image_tensor = self.transform(image)
         
-        return image_tensor, instance_idx
+        return image_tensor, category_idx, instance_name
     
     def __len__(self):
         return len(self.samples)

@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import numpy as np
 import random
@@ -7,6 +8,10 @@ from torch.utils.data import DataLoader, Subset
 from pytorch_lightning import Trainer 
 from pytorch_lightning.loggers import TensorBoardLogger 
 from pytorch_lightning.callbacks import ModelCheckpoint 
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from src.sketchy_dataset import TrainDataset, ValidDataset
 from src.model import ZS_SBIR

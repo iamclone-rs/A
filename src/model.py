@@ -1,3 +1,5 @@
+from collections import defaultdict
+
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
@@ -108,12 +110,19 @@ class ZS_SBIR(pl.LightningModule):
         }
         clip_model_distill = load_clip_to_cpu(args, design_details=design_details)
         
+        self.distance_fn = lambda x, y: 1.0 - F.cosine_similarity(x, y)
         self.best_metric = 0.0
         
         self.model = CustomCLIP(cfg=args, clip_model=clip_model, clip_model_distill=clip_model_distill)
     
-        self.val_step_outputs_sk = []
-        self.val_step_outputs_ph = []
+        self.val = defaultdict(
+            lambda: {
+                "val_sk_features": [],
+                "val_sk_names": [],
+                "val_img_features": [],
+                "val_img_names": [],
+            }
+        )
         
         
     def configure_optimizers(self):
@@ -140,36 +149,67 @@ class ZS_SBIR(pl.LightningModule):
     
     def validation_step(self, batch, batch_idx, dataloader_idx):
         classnames = get_all_categories(self.args, mode="test")
-        image_tensor, label = batch
+        image_tensor, category_idx, sample_names = batch
+        category_indices = category_idx.detach().cpu().tolist()
         if dataloader_idx == 0:
             feat = self.model.extract_feature(image_tensor, classname=classnames, type='sketch')
-            self.val_step_outputs_sk.append((feat, label))
+            for idx, category in enumerate(category_indices):
+                bucket = self.val[category]
+                bucket["val_sk_features"].append(feat[idx].detach().cpu())
+                bucket["val_sk_names"].append(sample_names[idx])
         else:
             feat = self.model.extract_feature(image_tensor, classname=classnames, type='photo')
-            self.val_step_outputs_ph.append((feat, label))
+            for idx, category in enumerate(category_indices):
+                bucket = self.val[category]
+                bucket["val_img_features"].append(feat[idx].detach().cpu())
+                bucket["val_img_names"].append(sample_names[idx])
     
     def on_validation_epoch_end(self):
-        if not self.val_step_outputs_sk or not self.val_step_outputs_ph:
+        top1_total = 0
+        top5_total = 0
+        total_sketches = 0
+
+        for _, bucket in self.val.items():
+            if not bucket["val_img_features"] or not bucket["val_sk_features"]:
+                continue
+
+            rank = torch.full((len(bucket["val_sk_names"]),), float("inf"))
+            val_img_feature = torch.stack(bucket["val_img_features"])
+
+            for idx, sketch_feature in enumerate(bucket["val_sk_features"]):
+                sketch_name = bucket["val_sk_names"][idx]
+                sketch_query_name = sketch_name.rsplit("/", 1)[-1]
+                sketch_query_name = sketch_query_name.rsplit("\\", 1)[-1]
+                sketch_query_name = sketch_query_name.rsplit(".", 1)[0]
+                sketch_query_name = sketch_query_name.rsplit("-", 1)[0]
+
+                if sketch_query_name not in bucket["val_img_names"]:
+                    continue
+
+                position_query = bucket["val_img_names"].index(sketch_query_name)
+
+                distance = self.distance_fn(sketch_feature.unsqueeze(0), val_img_feature)
+                target_distance = self.distance_fn(
+                    sketch_feature.unsqueeze(0),
+                    val_img_feature[position_query].unsqueeze(0),
+                )
+
+                rank[idx] = distance.le(target_distance).sum()
+
+            top1_total += rank.le(1).sum().item()
+            top5_total += rank.le(5).sum().item()
+            total_sketches += rank.shape[0]
+
+        if total_sketches == 0:
+            self.val.clear()
             return
 
-        query_feat_all = torch.cat([feat for feat, _ in self.val_step_outputs_sk], dim=0)
-        gallery_feat_all = torch.cat([feat for feat, _ in self.val_step_outputs_ph], dim=0)
-        query_instance_ids = torch.cat([label for _, label in self.val_step_outputs_sk], dim=0).to(query_feat_all.device)
-        gallery_instance_ids = torch.cat([label for _, label in self.val_step_outputs_ph], dim=0).to(query_feat_all.device)
-
-        similarity = query_feat_all @ gallery_feat_all.t()
-        top_k = min(5, similarity.shape[1])
-        topk_indices = similarity.topk(top_k, dim=1, largest=True, sorted=True).indices
-        retrieved_instance_ids = gallery_instance_ids[topk_indices]
-        matches = retrieved_instance_ids.eq(query_instance_ids.unsqueeze(1))
-
-        acc1 = matches[:, :1].any(dim=1).float().mean()
-        acc5 = matches[:, :top_k].any(dim=1).float().mean()
+        acc1 = top1_total / total_sketches
+        acc5 = top5_total / total_sketches
 
         self.log("acc1", acc1, on_step=False, on_epoch=True)
         self.log("acc5", acc5, on_step=False, on_epoch=True)
-        self.best_metric = max(self.best_metric, acc1.item())
+        self.best_metric = max(self.best_metric, acc1)
 
-        print(f"Acc@1: {acc1.item():.4f}, Acc@5: {acc5.item():.4f}")
-        self.val_step_outputs_sk.clear()
-        self.val_step_outputs_ph.clear()
+        print(f"Acc@1: {acc1:.4f}, Acc@5: {acc5:.4f}")
+        self.val.clear()
