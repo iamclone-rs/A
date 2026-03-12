@@ -5,6 +5,7 @@ from collections import defaultdict
 
 import torch
 from PIL import Image, ImageOps
+from torch.utils.data import Sampler, Subset
 from torchvision import transforms
 
 DEFAULT_VAL_RATIO = 0.2
@@ -140,46 +141,102 @@ class TrainDataset(torch.utils.data.Dataset):
         self.category_to_idx = {category: idx for idx, category in enumerate(self.all_categories)}
 
         train_records, _ = _get_split_records(self.opts)
+        self.records = train_records
+        self.instance_to_idx = {
+            record['instance_id']: idx for idx, record in enumerate(self.records)
+        }
+        self.sample_category_indices = [
+            self.category_to_idx[record['category']] for record in self.records
+        ]
 
-        self.samples = []
-        self.photo_entries = []
-        for record in train_records:
-            self.photo_entries.append((record['photo_path'], record['instance_id']))
-            for sketch_path in record['sketch_paths']:
-                self.samples.append((
-                    sketch_path,
-                    record['photo_path'],
-                    record['category'],
-                    record['instance_id'],
-                ))
-
-        if not self.samples:
+        if not self.records:
             raise RuntimeError('Training split is empty. Increase dataset size or reduce val_ratio.')
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.records)
         
     def __getitem__(self, index):
-        sk_path, img_path, category, instance_id = self.samples[index]
-
-        neg_path = img_path
-        if len(self.photo_entries) > 1:
-            neg_path, neg_instance_id = random.choice(self.photo_entries)
-            while neg_instance_id == instance_id:
-                neg_path, neg_instance_id = random.choice(self.photo_entries)
+        record = self.records[index]
+        sk_path = random.choice(record['sketch_paths'])
+        img_path = record['photo_path']
+        category_idx = self.category_to_idx[record['category']]
+        instance_idx = self.instance_to_idx[record['instance_id']]
 
         sk_data = _load_padded_image(sk_path, self.opts.max_size)
         img_data = _load_padded_image(img_path, self.opts.max_size)
-        neg_data = _load_padded_image(neg_path, self.opts.max_size)
 
         sk_tensor  = self.transform(sk_data)
         img_tensor = self.transform(img_data)
-        neg_tensor = self.transform(neg_data)
         
         sk_aug_tensor = self.aumentation(sk_data)
         img_aug_tensor = self.aumentation(img_data)
         
-        return img_tensor, sk_tensor, img_aug_tensor, sk_aug_tensor, neg_tensor, self.category_to_idx[category]
+        return img_tensor, sk_tensor, img_aug_tensor, sk_aug_tensor, category_idx, instance_idx
+
+
+def _category_indices_for_sampler(dataset):
+    if isinstance(dataset, Subset):
+        base_dataset = dataset.dataset
+        if not hasattr(base_dataset, 'sample_category_indices'):
+            raise ValueError('Subset base dataset must expose sample_category_indices for PK sampling.')
+        return [base_dataset.sample_category_indices[idx] for idx in dataset.indices]
+
+    if not hasattr(dataset, 'sample_category_indices'):
+        raise ValueError('Dataset must expose sample_category_indices for PK sampling.')
+
+    return list(dataset.sample_category_indices)
+
+
+class PKBatchSampler(Sampler):
+    def __init__(self, dataset, classes_per_batch, instances_per_class, batches_per_epoch=None):
+        self.dataset = dataset
+        self.classes_per_batch = classes_per_batch
+        self.instances_per_class = instances_per_class
+        self.batch_size = classes_per_batch * instances_per_class
+
+        category_indices = _category_indices_for_sampler(dataset)
+        self.category_to_sample_indices = defaultdict(list)
+        for sample_idx, category_idx in enumerate(category_indices):
+            self.category_to_sample_indices[category_idx].append(sample_idx)
+
+        self.available_categories = [
+            category for category, indices in self.category_to_sample_indices.items() if len(indices) > 0
+        ]
+        self.hard_negative_categories = [
+            category for category, indices in self.category_to_sample_indices.items() if len(indices) >= 2
+        ] or self.available_categories
+
+        if not self.available_categories:
+            raise RuntimeError('PKBatchSampler could not find any training samples.')
+
+        if batches_per_epoch is None:
+            total_samples = len(category_indices)
+            self.batches_per_epoch = max(1, total_samples // self.batch_size)
+            if total_samples % self.batch_size:
+                self.batches_per_epoch += 1
+        else:
+            self.batches_per_epoch = batches_per_epoch
+
+    def __len__(self):
+        return self.batches_per_epoch
+
+    def __iter__(self):
+        for _ in range(self.batches_per_epoch):
+            if len(self.hard_negative_categories) >= self.classes_per_batch:
+                batch_categories = random.sample(self.hard_negative_categories, self.classes_per_batch)
+            else:
+                batch_categories = random.choices(self.hard_negative_categories, k=self.classes_per_batch)
+
+            batch_indices = []
+            for category in batch_categories:
+                sample_indices = self.category_to_sample_indices[category]
+                if len(sample_indices) >= self.instances_per_class:
+                    batch_indices.extend(random.sample(sample_indices, self.instances_per_class))
+                else:
+                    batch_indices.extend(random.choices(sample_indices, k=self.instances_per_class))
+
+            random.shuffle(batch_indices)
+            yield batch_indices
 
 
 class ValidDataset(torch.utils.data.Dataset):

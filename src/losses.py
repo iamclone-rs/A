@@ -52,29 +52,71 @@ def cross_loss(feature_1, feature_2, args):
     return nn.CrossEntropyLoss()(logits, labels)
 
 
+def _directional_batch_hard_triplet(distance_matrix, category_labels, instance_labels, margin):
+    positive_distance = distance_matrix.diagonal()
+
+    same_category = category_labels.unsqueeze(1).eq(category_labels.unsqueeze(0))
+    different_instance = ~instance_labels.unsqueeze(1).eq(instance_labels.unsqueeze(0))
+
+    hard_negative_mask = same_category & different_instance
+    fallback_negative_mask = different_instance
+
+    hard_negative_distance = distance_matrix.masked_fill(~hard_negative_mask, float('inf')).min(dim=1).values
+    fallback_negative_distance = distance_matrix.masked_fill(~fallback_negative_mask, float('inf')).min(dim=1).values
+    hard_negative_distance = torch.where(
+        torch.isinf(hard_negative_distance),
+        fallback_negative_distance,
+        hard_negative_distance,
+    )
+
+    valid_rows = ~torch.isinf(hard_negative_distance)
+    if not valid_rows.any():
+        return distance_matrix.new_tensor(0.0)
+
+    triplet_loss = F.relu(
+        positive_distance[valid_rows] - hard_negative_distance[valid_rows] + margin
+    )
+    return triplet_loss.mean()
+
+
+def batch_hard_triplet_loss(sk_feature, photo_feature, category_labels, instance_labels, margin=0.3):
+    sk_feature = F.normalize(sk_feature, dim=1)
+    photo_feature = F.normalize(photo_feature, dim=1)
+
+    distance_matrix = 1.0 - sk_feature @ photo_feature.t()
+    loss_sk_to_photo = _directional_batch_hard_triplet(
+        distance_matrix, category_labels, instance_labels, margin
+    )
+    loss_photo_to_sk = _directional_batch_hard_triplet(
+        distance_matrix.t(), category_labels, instance_labels, margin
+    )
+
+    return 0.5 * (loss_sk_to_photo + loss_photo_to_sk)
+
+
 def loss_fn(args, model, features, mode='train'):
     photo_features_norm, sk_feature_norm, photo_aug_tensor, sk_aug_tensor, \
-        neg_features, label, pos_logits, sk_logits, photo_features, sk_features = features
+        category_labels, instance_labels, pos_logits, sk_logits, photo_features, sk_features = features
 
-    label = label.to(pos_logits.device)
+    category_labels = category_labels.to(pos_logits.device)
+    instance_labels = instance_labels.to(pos_logits.device)
     loss_mcc = mcc_loss(photo_features, sk_features)
-    loss_ce_photo = F.cross_entropy(pos_logits, label)
-    loss_ce_sk = F.cross_entropy(sk_logits, label)
+    loss_ce_photo = F.cross_entropy(pos_logits, category_labels)
+    loss_ce_sk = F.cross_entropy(sk_logits, category_labels)
     
-    photo_aug_features = model.model_distill.encode_image(photo_aug_tensor)
-    sk_aug_features = model.model_distill.encode_image(sk_aug_tensor)
+    with torch.no_grad():
+        photo_aug_features = model.model_distill.encode_image(photo_aug_tensor)
+        sk_aug_features = model.model_distill.encode_image(sk_aug_tensor)
     loss_distill_photo = cross_loss(photo_features, photo_aug_features, args)
     loss_distill_sk = cross_loss(sk_features, sk_aug_features, args)
     
     # photo_aug_features = (photo_aug_features / photo_aug_features.norm(dim=-1, keepdim=True))
     # sk_aug_features = (sk_aug_features / sk_aug_features.norm(dim=-1, keepdim=True))
     
-    distance_fn = lambda x, y: 1.0 - F.cosine_similarity(x, y)
-    triplet = nn.TripletMarginWithDistanceLoss(
-            distance_function=distance_fn, margin=0.3)
-    # triplet = nn.TripletMarginLoss(margin=0.2)
-    
-    loss_triplet = triplet(sk_feature_norm, photo_features_norm, neg_features)
+    margin = getattr(args, "triplet_margin", 0.3)
+    loss_triplet = batch_hard_triplet_loss(
+        sk_feature_norm, photo_features_norm, category_labels, instance_labels, margin=margin
+    )
     loss_photo_skt = cross_loss(photo_features, sk_features, args)
     
     loss_distill = loss_distill_photo + loss_distill_sk

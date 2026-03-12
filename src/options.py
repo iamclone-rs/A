@@ -19,9 +19,12 @@ parser.add_argument("--w_photo_skt", type=float, default=0.1, help="loss weight 
 parser.add_argument("--w_distill", type=float, default=0.1, help="loss weight for distillation")
 parser.add_argument("--w_ce", type=float, default=1.0, help="loss weight for (ce_photo + ce_sketch)")
 parser.add_argument("--w_mcc", type=float, default=0.1, help="loss weight for MCC")
+parser.add_argument("--triplet_margin", type=float, default=0.3)
 
 parser.add_argument("--lr", type=float, default=0.035)
 parser.add_argument('--batch_size', type=int, default=128)
+parser.add_argument('--classes_per_batch', type=int, default=8)
+parser.add_argument('--instances_per_class', type=int, default=0)
 parser.add_argument('--test_batch_size', type=int, default=1024)
 parser.add_argument('--epochs', type=int, default=60)
 parser.add_argument('--workers', type=int, default=4)
