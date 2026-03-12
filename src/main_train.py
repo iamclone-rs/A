@@ -67,7 +67,9 @@ if __name__ == "__main__":
     parser.add_argument("--w_distill", type=float, default=0.1, help="loss weight for distillation")
     parser.add_argument("--w_ce", type=float, default=1.0, help="loss weight for (ce_photo + ce_sketch)")
     parser.add_argument("--w_mcc", type=float, default=0.1, help="loss weight for MCC")
+    parser.add_argument("--w_cjs", type=float, default=0.1, help="loss weight for conditional cross-modal jigsaw")
     parser.add_argument("--triplet_margin", type=float, default=0.3, help="margin for triplet loss")
+    parser.add_argument("--jigsaw_grid", type=int, default=2, help="patch grid size for conditional cross-modal jigsaw")
     
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument('--batch_size', type=int, default=32)

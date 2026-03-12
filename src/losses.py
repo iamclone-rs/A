@@ -52,11 +52,28 @@ def cross_loss(feature_1, feature_2, args):
     return nn.CrossEntropyLoss()(logits, labels)
 
 
+def conditional_cross_modal_jigsaw_loss(model, sketch_feature, shuffled_sketch_feature, photo_feature, neg_feature, perm_labels):
+    perm_labels = perm_labels.long()
+
+    anchor_logits = model.compute_jigsaw_logits(sketch_feature, shuffled_sketch_feature)
+    pos_logits = model.compute_jigsaw_logits(photo_feature, shuffled_sketch_feature)
+    neg_logits = model.compute_jigsaw_logits(neg_feature, shuffled_sketch_feature)
+
+    loss_ce = F.cross_entropy(anchor_logits, perm_labels)
+    pos_ce = F.cross_entropy(pos_logits, perm_labels, reduction='none')
+    neg_ce = F.cross_entropy(neg_logits, perm_labels, reduction='none')
+    loss_margin = F.relu(pos_ce - neg_ce).mean()
+
+    return loss_ce + loss_margin
+
+
 def loss_fn(args, model, features, mode='train'):
     photo_features_norm, sk_feature_norm, photo_aug_tensor, sk_aug_tensor, \
-        neg_features, category_labels, pos_logits, sk_logits, photo_features, sk_features = features
+        neg_features, category_labels, perm_labels, pos_logits, sk_logits, \
+        photo_features, sk_features, neg_feature_raw, sk_jigsaw_feature = features
 
     category_labels = category_labels.to(pos_logits.device)
+    perm_labels = perm_labels.to(pos_logits.device)
     loss_mcc = mcc_loss(photo_features, sk_features)
     loss_ce_photo = F.cross_entropy(pos_logits, category_labels)
     loss_ce_sk = F.cross_entropy(sk_logits, category_labels)
@@ -77,6 +94,18 @@ def loss_fn(args, model, features, mode='train'):
     )
     loss_triplet = triplet(sk_feature_norm, photo_features_norm, neg_features)
     loss_photo_skt = cross_loss(photo_features, sk_features, args)
+    w_cjs = getattr(args, "w_cjs", 0.0)
+    if w_cjs > 0:
+        loss_cjs = conditional_cross_modal_jigsaw_loss(
+            model,
+            sk_features,
+            sk_jigsaw_feature,
+            photo_features,
+            neg_feature_raw,
+            perm_labels,
+        )
+    else:
+        loss_cjs = photo_features.new_tensor(0.0)
     
     loss_distill = loss_distill_photo + loss_distill_sk
 
@@ -92,4 +121,5 @@ def loss_fn(args, model, features, mode='train'):
         + w_distill * loss_distill
         + w_ce * (loss_ce_photo + loss_ce_sk)
         + w_mcc * loss_mcc
+        + w_cjs * loss_cjs
     )

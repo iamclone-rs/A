@@ -1,4 +1,5 @@
 from collections import defaultdict
+import math
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,28 @@ def freeze_all_but_bn(m):
             m.weight.requires_grad_(False)
         if hasattr(m, 'bias') and m.bias is not None:
             m.bias.requires_grad_(False)
+
+
+class JigsawHead(nn.Module):
+    def __init__(self, feature_dim=512, num_permutations=24, num_heads=8, num_layers=2):
+        super().__init__()
+        self.positional_embedding = nn.Parameter(torch.zeros(1, 2, feature_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=feature_dim,
+            nhead=num_heads,
+            dim_feedforward=feature_dim * 2,
+            dropout=0.1,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(feature_dim * 2),
+            nn.Linear(feature_dim * 2, feature_dim),
+            nn.GELU(),
+            nn.Linear(feature_dim, num_permutations),
+        )
             
 class CustomCLIP(nn.Module):
     def __init__(
@@ -37,6 +60,10 @@ class CustomCLIP(nn.Module):
         self.model_distill = clip_model_distill
         self.image_adapter_m = 0.1
         self.text_adapter_m = 0.1
+        self.jigsaw_head = JigsawHead(
+            feature_dim=512,
+            num_permutations=math.factorial(getattr(cfg, 'jigsaw_grid', 2) ** 2),
+        )
     
     def get_logits(self, img_tensor, classnames, type='photo'):
         if type=='photo':
@@ -82,17 +109,39 @@ class CustomCLIP(nn.Module):
         return logits, image_features_normalize, image_features
         
     def forward(self, x, classnames):
-        photo_tensor, sk_tensor, photo_aug_tensor, sk_aug_tensor, neg_tensor, category_label = x
+        (
+            photo_tensor,
+            sk_tensor,
+            photo_aug_tensor,
+            sk_aug_tensor,
+            neg_tensor,
+            sk_jigsaw_tensor,
+            perm_label,
+            category_label,
+        ) = x
         pos_logits, photo_features_norm, photo_feature = self.get_logits(photo_tensor, classnames)
         sk_logits, sk_feature_norm, sk_feature = self.get_logits(sk_tensor, classnames, type='sketch')
-        _, neg_feature, _ = self.get_logits(neg_tensor, classnames)
+        _, neg_feature_norm, neg_feature = self.get_logits(neg_tensor, classnames)
+        _, sk_jigsaw_feature_norm, sk_jigsaw_feature = self.get_logits(sk_jigsaw_tensor, classnames, type='sketch')
         
         return photo_features_norm, sk_feature_norm, photo_aug_tensor, sk_aug_tensor, \
-            neg_feature, category_label, pos_logits, sk_logits, photo_feature, sk_feature
+            neg_feature_norm, category_label, perm_label, pos_logits, sk_logits, \
+            photo_feature, sk_feature, neg_feature, sk_jigsaw_feature
             
     def extract_feature(self, image, classname, type='photo'):
         _, feature, _ = self.get_logits(image, classnames=classname, type=type)
         return feature
+
+    def compute_jigsaw_logits(self, first_feature, second_feature):
+        tokens = torch.stack(
+            [F.normalize(first_feature, dim=-1), F.normalize(second_feature, dim=-1)],
+            dim=1,
+        )
+        tokens = tokens.to(self.jigsaw_head.positional_embedding.dtype)
+        tokens = tokens + self.jigsaw_head.positional_embedding
+        encoded = self.jigsaw_head.encoder(tokens)
+        logits = self.jigsaw_head.classifier(encoded.reshape(encoded.shape[0], -1))
+        return logits
             
 class ZS_SBIR(pl.LightningModule):
     def __init__(self, args, classname):

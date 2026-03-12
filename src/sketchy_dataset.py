@@ -1,4 +1,5 @@
 import glob
+import itertools
 import os
 import random
 from collections import defaultdict
@@ -52,6 +53,30 @@ def _sketch_instance_id(filepath):
 def _load_padded_image(filepath, max_size):
     with Image.open(filepath) as image:
         return ImageOps.pad(image.convert('RGB'), size=(max_size, max_size))
+
+
+def _shuffle_image_patches(image, grid_size, permutation):
+    width, height = image.size
+    patch_width = width // grid_size
+    patch_height = height // grid_size
+
+    patches = []
+    boxes = []
+    for row in range(grid_size):
+        for col in range(grid_size):
+            left = col * patch_width
+            upper = row * patch_height
+            right = width if col == grid_size - 1 else (col + 1) * patch_width
+            lower = height if row == grid_size - 1 else (row + 1) * patch_height
+            box = (left, upper, right, lower)
+            patches.append(image.crop(box))
+            boxes.append(box)
+
+    shuffled = Image.new(image.mode, image.size)
+    for target_idx, source_idx in enumerate(permutation):
+        shuffled.paste(patches[source_idx], boxes[target_idx])
+
+    return shuffled
 
 
 def _build_instance_records(root):
@@ -136,6 +161,10 @@ class TrainDataset(torch.utils.data.Dataset):
         self.transform = normal_transform()
         self.return_orig = return_orig
         self.aumentation = aumented_transform()
+        self.jigsaw_grid = getattr(self.opts, 'jigsaw_grid', 2)
+        if self.jigsaw_grid != 2:
+            raise ValueError('Only 2x2 conditional cross-modal jigsaw is currently implemented.')
+        self.jigsaw_permutations = list(itertools.permutations(range(self.jigsaw_grid ** 2)))
         self.all_categories = _list_categories(self.opts.root)
         self.category_to_idx = {category: idx for idx, category in enumerate(self.all_categories)}
 
@@ -184,15 +213,31 @@ class TrainDataset(torch.utils.data.Dataset):
         sk_data = _load_padded_image(sk_path, self.opts.max_size)
         img_data = _load_padded_image(img_path, self.opts.max_size)
         neg_data = _load_padded_image(neg_path, self.opts.max_size)
+        perm_label = random.randrange(len(self.jigsaw_permutations))
+        sk_jigsaw_data = _shuffle_image_patches(
+            sk_data,
+            self.jigsaw_grid,
+            self.jigsaw_permutations[perm_label],
+        )
 
         sk_tensor  = self.transform(sk_data)
+        sk_jigsaw_tensor = self.transform(sk_jigsaw_data)
         img_tensor = self.transform(img_data)
         neg_tensor = self.transform(neg_data)
         
         sk_aug_tensor = self.aumentation(sk_data)
         img_aug_tensor = self.aumentation(img_data)
         
-        return img_tensor, sk_tensor, img_aug_tensor, sk_aug_tensor, neg_tensor, category_idx
+        return (
+            img_tensor,
+            sk_tensor,
+            img_aug_tensor,
+            sk_aug_tensor,
+            neg_tensor,
+            sk_jigsaw_tensor,
+            perm_label,
+            category_idx,
+        )
 
 
 class ValidDataset(torch.utils.data.Dataset):
