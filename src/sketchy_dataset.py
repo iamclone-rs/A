@@ -7,6 +7,8 @@ import torch
 from PIL import Image, ImageOps
 from torchvision import transforms
 
+from src.data_config import UNSEEN_CLASSES
+
 DEFAULT_VAL_RATIO = 0.2
 DEFAULT_SPLIT_SEED = 42
 
@@ -55,9 +57,14 @@ def _load_padded_image(filepath, max_size):
 
 
 def _build_instance_records(root):
+    categories = _list_categories(root)
+    return _build_instance_records_for_categories(root, categories)
+
+
+def _build_instance_records_for_categories(root, categories):
     records = []
 
-    for category in _list_categories(root):
+    for category in categories:
         photo_dir = os.path.join(root, 'photo', category)
         sketch_dir = os.path.join(root, 'sketch', category)
 
@@ -89,6 +96,19 @@ def _build_instance_records(root):
         )
 
     return records
+
+
+def _get_categories_for_mode(opts, mode):
+    all_categories = _list_categories(opts.root)
+    unseen_classes = set(UNSEEN_CLASSES.get(opts.dataset, []))
+
+    if not unseen_classes:
+        return all_categories
+
+    if mode == 'train':
+        return sorted(category for category in all_categories if category not in unseen_classes)
+
+    return sorted(category for category in all_categories if category in unseen_classes)
 
 
 def _split_instance_records(records, val_ratio, split_seed):
@@ -125,6 +145,14 @@ def _split_instance_records(records, val_ratio, split_seed):
 
 
 def _get_split_records(opts):
+    unseen_classes = set(UNSEEN_CLASSES.get(opts.dataset, []))
+    if unseen_classes:
+        train_categories = _get_categories_for_mode(opts, 'train')
+        valid_categories = _get_categories_for_mode(opts, 'test')
+        train_records = _build_instance_records_for_categories(opts.root, train_categories)
+        valid_records = _build_instance_records_for_categories(opts.root, valid_categories)
+        return train_records, valid_records
+
     val_ratio = getattr(opts, 'val_ratio', DEFAULT_VAL_RATIO)
     split_seed = getattr(opts, 'split_seed', DEFAULT_SPLIT_SEED)
     records = _build_instance_records(opts.root)
@@ -136,7 +164,7 @@ class TrainDataset(torch.utils.data.Dataset):
         self.transform = normal_transform()
         self.return_orig = return_orig
         self.aumentation = aumented_transform()
-        self.all_categories = _list_categories(self.opts.root)
+        self.all_categories = _get_categories_for_mode(self.opts, 'train')
         self.category_to_idx = {category: idx for idx, category in enumerate(self.all_categories)}
 
         train_records, _ = _get_split_records(self.opts)
@@ -189,7 +217,7 @@ class ValidDataset(torch.utils.data.Dataset):
         self.mode = mode
         self.transform = normal_transform()
         _, valid_records = _get_split_records(self.args)
-        self.all_categories = _list_categories(self.args.root)
+        self.all_categories = _get_categories_for_mode(self.args, 'test')
         self.category_to_idx = {category: idx for idx, category in enumerate(self.all_categories)}
 
         if not valid_records:

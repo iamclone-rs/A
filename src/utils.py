@@ -32,18 +32,20 @@ def _list_categories(root):
     )
 
 
+def split_categories_by_zero_shot(dataset_name, categories, mode="train"):
+    unseen_classes = set(UNSEEN_CLASSES.get(dataset_name, []))
+    if not unseen_classes:
+        return sorted(categories)
+
+    if mode == "train":
+        return sorted(category for category in categories if category not in unseen_classes)
+
+    return sorted(category for category in categories if category in unseen_classes)
+
+
 def get_all_categories(args, mode="train"):
     all_categories = _list_categories(args.root)
-
-    if getattr(args, "fg_sbir", True):
-        return all_categories
-
-    unseen_classes = UNSEEN_CLASSES.get(args.dataset, [])
-    if mode=="train":
-        all_categories = list(set(all_categories) - set(unseen_classes))
-    else:
-        all_categories = list(set(unseen_classes))
-    return sorted(all_categories)
+    return split_categories_by_zero_shot(args.dataset, all_categories, mode=mode)
 
 def get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
