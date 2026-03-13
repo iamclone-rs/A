@@ -169,14 +169,12 @@ class TrainDataset(torch.utils.data.Dataset):
 
         train_records, _ = _get_split_records(self.opts)
         self.train_records = train_records
+        self.instance_to_idx = {
+            record['instance_id']: idx for idx, record in enumerate(self.train_records)
+        }
 
         self.samples = []
-        self.photo_entries = []
-        self.photo_entries_by_category = defaultdict(list)
         for record in train_records:
-            photo_entry = (record['photo_path'], record['category'], record['instance_id'])
-            self.photo_entries.append(photo_entry)
-            self.photo_entries_by_category[record['category']].append(photo_entry)
             for sketch_path in record['sketch_paths']:
                 self.samples.append((
                     sketch_path,
@@ -188,66 +186,29 @@ class TrainDataset(torch.utils.data.Dataset):
         if not self.samples:
             raise RuntimeError('Training split is empty. Increase dataset size or reduce val_ratio.')
 
-        self.mined_negative_paths = [None] * len(self.samples)
-
     def __len__(self):
         return len(self.samples)
-
-    def get_photo_mining_items(self):
-        return [
-            (record['photo_path'], record['category'], record['instance_id'])
-            for record in self.train_records
-        ]
-
-    def get_sketch_mining_items(self):
-        return [
-            (sample_idx, sketch_path, category, instance_id)
-            for sample_idx, (sketch_path, _, category, instance_id) in enumerate(self.samples)
-        ]
-
-    def load_tensor_from_path(self, filepath):
-        image = _load_padded_image(filepath, self.opts.max_size)
-        return self.transform(image)
-
-    def update_mined_negatives(self, mined_negative_by_sample_idx):
-        for sample_idx in range(len(self.samples)):
-            self.mined_negative_paths[sample_idx] = mined_negative_by_sample_idx.get(sample_idx)
         
     def __getitem__(self, index):
         sk_path, img_path, category, instance_id = self.samples[index]
 
-        mined_neg_path = self.mined_negative_paths[index]
-        if mined_neg_path is not None:
-            neg_path = mined_neg_path
-        else:
-            same_category_negatives = [
-                photo_path
-                for photo_path, _, neg_instance_id in self.photo_entries_by_category[category]
-                if neg_instance_id != instance_id
-            ]
-
-            if same_category_negatives:
-                neg_path = random.choice(same_category_negatives)
-            else:
-                fallback_negatives = [
-                photo_path
-                for photo_path, _, neg_instance_id in self.photo_entries
-                if neg_instance_id != instance_id
-                ]
-                neg_path = random.choice(fallback_negatives) if fallback_negatives else img_path
-
         sk_data = _load_padded_image(sk_path, self.opts.max_size)
         img_data = _load_padded_image(img_path, self.opts.max_size)
-        neg_data = _load_padded_image(neg_path, self.opts.max_size)
 
         sk_tensor  = self.transform(sk_data)
         img_tensor = self.transform(img_data)
-        neg_tensor = self.transform(neg_data)
         
         sk_aug_tensor = self.aumentation(sk_data)
         img_aug_tensor = self.aumentation(img_data)
         
-        return img_tensor, sk_tensor, img_aug_tensor, sk_aug_tensor, neg_tensor, self.category_to_idx[category]
+        return (
+            img_tensor,
+            sk_tensor,
+            img_aug_tensor,
+            sk_aug_tensor,
+            self.category_to_idx[category],
+            self.instance_to_idx[instance_id],
+        )
 
 
 class ValidDataset(torch.utils.data.Dataset):

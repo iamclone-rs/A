@@ -1,5 +1,3 @@
-import os
-import copy
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -52,11 +50,47 @@ def cross_loss(feature_1, feature_2, args):
     return nn.CrossEntropyLoss()(logits, labels)
 
 
+def in_batch_triplet_loss(sketch_features, photo_features, category_idx, instance_idx, margin=0.3):
+    distance_matrix = 1.0 - sketch_features @ photo_features.t()
+    positive_distance = distance_matrix.diag()
+
+    same_category = category_idx.unsqueeze(0) == category_idx.unsqueeze(1)
+    same_instance = instance_idx.unsqueeze(0) == instance_idx.unsqueeze(1)
+
+    same_category_negative_mask = same_category & ~same_instance
+    fallback_negative_mask = ~same_instance
+
+    same_category_negative_distance = distance_matrix.masked_fill(
+        ~same_category_negative_mask, float("inf")
+    ).min(dim=1).values
+    fallback_negative_distance = distance_matrix.masked_fill(
+        ~fallback_negative_mask, float("inf")
+    ).min(dim=1).values
+
+    negative_distance = torch.where(
+        torch.isfinite(same_category_negative_distance),
+        same_category_negative_distance,
+        fallback_negative_distance,
+    )
+    valid_anchor_mask = torch.isfinite(negative_distance)
+
+    if not valid_anchor_mask.any():
+        return positive_distance.new_zeros(())
+
+    triplet_loss = F.relu(
+        positive_distance[valid_anchor_mask]
+        - negative_distance[valid_anchor_mask]
+        + margin
+    )
+    return triplet_loss.mean()
+
+
 def loss_fn(args, model, features, mode='train'):
     photo_features_norm, sk_feature_norm, photo_aug_tensor, sk_aug_tensor, \
-        neg_features, label, pos_logits, sk_logits, photo_features, sk_features = features
+        label, instance_idx, pos_logits, sk_logits, photo_features, sk_features = features
 
     label = label.to(pos_logits.device)
+    instance_idx = instance_idx.to(pos_logits.device)
     loss_mcc = mcc_loss(photo_features, sk_features)
     loss_ce_photo = F.cross_entropy(pos_logits, label)
     loss_ce_sk = F.cross_entropy(sk_logits, label)
@@ -68,13 +102,14 @@ def loss_fn(args, model, features, mode='train'):
     
     # photo_aug_features = (photo_aug_features / photo_aug_features.norm(dim=-1, keepdim=True))
     # sk_aug_features = (sk_aug_features / sk_aug_features.norm(dim=-1, keepdim=True))
-    
-    distance_fn = lambda x, y: 1.0 - F.cosine_similarity(x, y)
-    triplet = nn.TripletMarginWithDistanceLoss(
-            distance_function=distance_fn, margin=0.3)
-    # triplet = nn.TripletMarginLoss(margin=0.2)
-    
-    loss_triplet = triplet(sk_feature_norm, photo_features_norm, neg_features)
+
+    loss_triplet = in_batch_triplet_loss(
+        sk_feature_norm,
+        photo_features_norm,
+        label,
+        instance_idx,
+        margin=getattr(args, "triplet_margin", 0.3),
+    )
     loss_photo_skt = cross_loss(photo_features, sk_features, args)
     
     loss_distill = loss_distill_photo + loss_distill_sk
