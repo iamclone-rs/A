@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from torch.nn import functional as F
+from torch.utils.data import Subset
 
 from src.coprompt import MultiModalPromptLearner, Adapter, TextEncoder
 from src.utils import load_clip_to_cpu, get_all_categories
@@ -112,6 +113,7 @@ class ZS_SBIR(pl.LightningModule):
         
         self.distance_fn = lambda x, y: 1.0 - F.cosine_similarity(x, y)
         self.best_metric = 0.0
+        self.train_dataset = None
         
         self.model = CustomCLIP(cfg=args, clip_model=clip_model, clip_model_distill=clip_model_distill)
     
@@ -135,6 +137,87 @@ class ZS_SBIR(pl.LightningModule):
         )
         
         return [optimizer] , [scheduler]
+
+    def set_train_dataset(self, dataset):
+        if isinstance(dataset, Subset):
+            self.train_dataset = dataset.dataset
+        else:
+            self.train_dataset = dataset
+
+    def _encode_mining_items(self, items, type='photo'):
+        if not items:
+            return torch.empty(0, 512), []
+
+        batch_size = getattr(self.args, 'mine_batch_size', self.args.test_batch_size)
+        all_features = []
+        metadata = []
+
+        for start in range(0, len(items), batch_size):
+            batch_items = items[start:start + batch_size]
+            batch_tensor = torch.stack([
+                self.train_dataset.load_tensor_from_path(item[0 if type == 'photo' else 1])
+                for item in batch_items
+            ]).to(self.device)
+            feats = self.model.extract_feature(batch_tensor, classname=self.classname, type=type)
+            all_features.append(feats.detach().cpu())
+            metadata.extend(batch_items)
+
+        return torch.cat(all_features, dim=0), metadata
+
+    def _run_offline_negative_mining(self):
+        if self.train_dataset is None:
+            return
+
+        photo_items = self.train_dataset.get_photo_mining_items()
+        sketch_items = self.train_dataset.get_sketch_mining_items()
+        if not photo_items or not sketch_items:
+            return
+
+        was_training = self.model.training
+        self.model.eval()
+
+        with torch.no_grad():
+            photo_features, photo_metadata = self._encode_mining_items(photo_items, type='photo')
+            sketch_features, sketch_metadata = self._encode_mining_items(sketch_items, type='sketch')
+
+        if was_training:
+            self.model.train()
+
+        photo_features = F.normalize(photo_features, dim=1)
+        sketch_features = F.normalize(sketch_features, dim=1)
+
+        photo_by_category = defaultdict(list)
+        for photo_idx, (_, category, instance_id) in enumerate(photo_metadata):
+            photo_by_category[category].append((photo_idx, instance_id))
+
+        global_photo_instance_ids = [instance_id for _, _, instance_id in photo_metadata]
+        global_similarity = sketch_features @ photo_features.t()
+        mined_negative_by_sample_idx = {}
+
+        for sketch_idx, (sample_idx, _, category, instance_id) in enumerate(sketch_metadata):
+            candidate_photo_info = photo_by_category.get(category, [])
+            if candidate_photo_info:
+                candidate_indices = [idx for idx, photo_instance_id in candidate_photo_info if photo_instance_id != instance_id]
+            else:
+                candidate_indices = []
+
+            if candidate_indices:
+                candidate_scores = global_similarity[sketch_idx, candidate_indices]
+                best_candidate = candidate_indices[candidate_scores.argmax().item()]
+            else:
+                candidate_indices = [
+                    idx for idx, photo_instance_id in enumerate(global_photo_instance_ids)
+                    if photo_instance_id != instance_id
+                ]
+                if not candidate_indices:
+                    continue
+                candidate_scores = global_similarity[sketch_idx, candidate_indices]
+                best_candidate = candidate_indices[candidate_scores.argmax().item()]
+
+            mined_negative_by_sample_idx[sample_idx] = photo_metadata[best_candidate][0]
+
+        self.train_dataset.update_mined_negatives(mined_negative_by_sample_idx)
+        print(f'Offline mining updated negatives for {len(mined_negative_by_sample_idx)} sketches.')
     
     def forward(self, data, classname):
         return self.model(data, classname)
@@ -163,6 +246,14 @@ class ZS_SBIR(pl.LightningModule):
                 bucket = self.val[category]
                 bucket["val_img_features"].append(feat[idx].detach().cpu())
                 bucket["val_img_names"].append(sample_names[idx])
+
+    def on_train_epoch_end(self):
+        mine_every = getattr(self.args, 'mine_every_n_epochs', 0)
+        if mine_every <= 0:
+            return
+        if (self.current_epoch + 1) % mine_every != 0:
+            return
+        self._run_offline_negative_mining()
     
     def on_validation_epoch_end(self):
         top1_total = 0
