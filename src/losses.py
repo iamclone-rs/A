@@ -50,9 +50,8 @@ def cross_loss(feature_1, feature_2, args):
     return nn.CrossEntropyLoss()(logits, labels)
 
 
-def in_batch_triplet_loss(sketch_features, photo_features, category_idx, instance_idx, margin=0.3):
+def select_in_batch_negative_indices(sketch_features, photo_features, category_idx, instance_idx):
     distance_matrix = 1.0 - sketch_features @ photo_features.t()
-    positive_distance = distance_matrix.diag()
 
     same_category = category_idx.unsqueeze(0) == category_idx.unsqueeze(1)
     same_instance = instance_idx.unsqueeze(0) == instance_idx.unsqueeze(1)
@@ -74,6 +73,21 @@ def in_batch_triplet_loss(sketch_features, photo_features, category_idx, instanc
     )
     valid_anchor_mask = torch.isfinite(negative_distance)
 
+    negative_indices = torch.where(
+        torch.isfinite(same_category_negative_distance),
+        distance_matrix.masked_fill(~same_category_negative_mask, float("inf")).min(dim=1).indices,
+        distance_matrix.masked_fill(~fallback_negative_mask, float("inf")).min(dim=1).indices,
+    )
+
+    return distance_matrix, negative_distance, negative_indices, valid_anchor_mask
+
+
+def in_batch_triplet_loss(sketch_features, photo_features, category_idx, instance_idx, margin=0.3):
+    distance_matrix, negative_distance, _, valid_anchor_mask = select_in_batch_negative_indices(
+        sketch_features, photo_features, category_idx, instance_idx
+    )
+    positive_distance = distance_matrix.diag()
+
     if not valid_anchor_mask.any():
         return positive_distance.new_zeros(())
 
@@ -85,12 +99,54 @@ def in_batch_triplet_loss(sketch_features, photo_features, category_idx, instanc
     return triplet_loss.mean()
 
 
+def conditional_cross_modal_jigsaw_loss(
+    args,
+    model,
+    photo_features,
+    sketch_features,
+    shuffled_sketch_features,
+    perm_label,
+    negative_indices,
+    valid_anchor_mask,
+):
+    anchor_logits = model.compute_jigsaw_logits(sketch_features, shuffled_sketch_features)
+    loss_anchor = F.cross_entropy(anchor_logits.float(), perm_label)
+
+    if not valid_anchor_mask.any():
+        return loss_anchor
+
+    positive_logits = model.compute_jigsaw_logits(
+        photo_features[valid_anchor_mask],
+        shuffled_sketch_features[valid_anchor_mask],
+    )
+    negative_logits = model.compute_jigsaw_logits(
+        photo_features[negative_indices[valid_anchor_mask]],
+        shuffled_sketch_features[valid_anchor_mask],
+    )
+
+    positive_ce = F.cross_entropy(
+        positive_logits.float(),
+        perm_label[valid_anchor_mask],
+        reduction='none',
+    )
+    negative_ce = F.cross_entropy(
+        negative_logits.float(),
+        perm_label[valid_anchor_mask],
+        reduction='none',
+    )
+    margin = getattr(args, "cjs_margin", 0.1)
+    loss_hinge = F.relu(positive_ce - negative_ce + margin).mean()
+    return loss_anchor + loss_hinge
+
+
 def loss_fn(args, model, features, mode='train'):
     photo_features_norm, sk_feature_norm, photo_aug_tensor, sk_aug_tensor, \
-        label, instance_idx, pos_logits, sk_logits, photo_features, sk_features = features
+        label, instance_idx, pos_logits, sk_logits, photo_features, sk_features, \
+        shuffled_sk_feature_norm, perm_label = features
 
     label = label.to(pos_logits.device)
     instance_idx = instance_idx.to(pos_logits.device)
+    perm_label = perm_label.to(pos_logits.device)
     loss_mcc = mcc_loss(photo_features, sk_features)
     loss_ce_photo = F.cross_entropy(pos_logits, label)
     loss_ce_sk = F.cross_entropy(sk_logits, label)
@@ -103,6 +159,9 @@ def loss_fn(args, model, features, mode='train'):
     # photo_aug_features = (photo_aug_features / photo_aug_features.norm(dim=-1, keepdim=True))
     # sk_aug_features = (sk_aug_features / sk_aug_features.norm(dim=-1, keepdim=True))
 
+    _, _, negative_indices, valid_anchor_mask = select_in_batch_negative_indices(
+        sk_feature_norm, photo_features_norm, label, instance_idx
+    )
     loss_triplet = in_batch_triplet_loss(
         sk_feature_norm,
         photo_features_norm,
@@ -119,6 +178,20 @@ def loss_fn(args, model, features, mode='train'):
     w_distill = getattr(args, "w_distill", getattr(args, "gamma", 1.0))
     w_ce = getattr(args, "w_ce", 1.0)
     w_mcc = getattr(args, "w_mcc", getattr(args, "lambd", 1.0))
+    w_cjs = getattr(args, "w_cjs", 0.0)
+    loss_cjs = photo_features.new_zeros(())
+
+    if w_cjs > 0 and shuffled_sk_feature_norm is not None:
+        loss_cjs = conditional_cross_modal_jigsaw_loss(
+            args,
+            model,
+            photo_features_norm,
+            sk_feature_norm,
+            shuffled_sk_feature_norm,
+            perm_label,
+            negative_indices,
+            valid_anchor_mask,
+        )
 
     return (
         w_triplet * loss_triplet
@@ -126,4 +199,5 @@ def loss_fn(args, model, features, mode='train'):
         + w_distill * loss_distill
         + w_ce * (loss_ce_photo + loss_ce_sk)
         + w_mcc * loss_mcc
+        + w_cjs * loss_cjs
     )

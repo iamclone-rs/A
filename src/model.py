@@ -1,4 +1,5 @@
 from collections import defaultdict
+from math import factorial
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,19 @@ def freeze_all_but_bn(m):
             m.weight.requires_grad_(False)
         if hasattr(m, 'bias') and m.bias is not None:
             m.bias.requires_grad_(False)
+
+
+class JigsawHead(nn.Module):
+    def __init__(self, feature_dim, num_permutations, dtype):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim * 2, feature_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(feature_dim, num_permutations),
+        ).to(dtype)
+
+    def forward(self, feature_a, feature_b):
+        return self.net(torch.cat([feature_a, feature_b], dim=-1))
             
 class CustomCLIP(nn.Module):
     def __init__(
@@ -37,6 +51,12 @@ class CustomCLIP(nn.Module):
         self.model_distill = clip_model_distill
         self.image_adapter_m = 0.1
         self.text_adapter_m = 0.1
+        self.use_cjs = getattr(cfg, 'w_cjs', 0.0) > 0
+        self.jigsaw_head = JigsawHead(
+            feature_dim=512,
+            num_permutations=factorial(getattr(cfg, 'jigsaw_grid', 2) ** 2),
+            dtype=clip_model.dtype,
+        )
     
     def get_logits(self, img_tensor, classnames, type='photo'):
         if type=='photo':
@@ -82,16 +102,25 @@ class CustomCLIP(nn.Module):
         return logits, image_features_normalize, image_features
         
     def forward(self, x, classnames):
-        photo_tensor, sk_tensor, photo_aug_tensor, sk_aug_tensor, label, instance_idx = x
+        photo_tensor, sk_tensor, photo_aug_tensor, sk_aug_tensor, shuffled_sk_tensor, perm_label, label, instance_idx = x
         pos_logits, photo_features_norm, photo_feature = self.get_logits(photo_tensor, classnames)
         sk_logits, sk_feature_norm, sk_feature = self.get_logits(sk_tensor, classnames, type='sketch')
+        shuffled_sk_feature_norm = None
+        if self.use_cjs:
+            _, shuffled_sk_feature_norm, _ = self.get_logits(
+                shuffled_sk_tensor, classnames, type='sketch'
+            )
         
         return photo_features_norm, sk_feature_norm, photo_aug_tensor, sk_aug_tensor, \
-            label, instance_idx, pos_logits, sk_logits, photo_feature, sk_feature
+            label, instance_idx, pos_logits, sk_logits, photo_feature, sk_feature, \
+            shuffled_sk_feature_norm, perm_label
             
     def extract_feature(self, image, classname, type='photo'):
         _, feature, _ = self.get_logits(image, classnames=classname, type=type)
         return feature
+
+    def compute_jigsaw_logits(self, feature_a, shuffled_sketch_feature):
+        return self.jigsaw_head(feature_a.type(self.dtype), shuffled_sketch_feature.type(self.dtype))
             
 class ZS_SBIR(pl.LightningModule):
     def __init__(self, args, classname):

@@ -1,4 +1,5 @@
 import glob
+import itertools
 import os
 import random
 from collections import defaultdict
@@ -11,6 +12,7 @@ from src.data_config import UNSEEN_CLASSES
 
 DEFAULT_VAL_RATIO = 0.2
 DEFAULT_SPLIT_SEED = 42
+_JIGSAW_PERMUTATIONS = {}
 
 def aumented_transform():
     transform_list = [
@@ -31,6 +33,40 @@ def normal_transform():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     return dataset_transforms
+
+
+def _get_jigsaw_permutations(grid_size):
+    if grid_size not in _JIGSAW_PERMUTATIONS:
+        tile_count = grid_size * grid_size
+        if tile_count > 4:
+            raise ValueError('Only 2x2 jigsaw is supported in this implementation.')
+        _JIGSAW_PERMUTATIONS[grid_size] = list(itertools.permutations(range(tile_count)))
+    return _JIGSAW_PERMUTATIONS[grid_size]
+
+
+def _shuffle_image_patches(image, grid_size, permutation):
+    width, height = image.size
+    patch_width = width // grid_size
+    patch_height = height // grid_size
+    patches = []
+
+    for row in range(grid_size):
+        for col in range(grid_size):
+            left = col * patch_width
+            upper = row * patch_height
+            right = width if col == grid_size - 1 else (col + 1) * patch_width
+            lower = height if row == grid_size - 1 else (row + 1) * patch_height
+            patches.append(image.crop((left, upper, right, lower)))
+
+    shuffled = Image.new(image.mode, (width, height))
+    for dst_idx, src_idx in enumerate(permutation):
+        row = dst_idx // grid_size
+        col = dst_idx % grid_size
+        left = col * patch_width
+        upper = row * patch_height
+        shuffled.paste(patches[src_idx], (left, upper))
+
+    return shuffled
 
 
 def _list_categories(root):
@@ -166,6 +202,8 @@ class TrainDataset(torch.utils.data.Dataset):
         self.aumentation = aumented_transform()
         self.all_categories = _get_categories_for_mode(self.opts, 'train')
         self.category_to_idx = {category: idx for idx, category in enumerate(self.all_categories)}
+        self.jigsaw_grid = getattr(self.opts, 'jigsaw_grid', 2)
+        self.jigsaw_permutations = _get_jigsaw_permutations(self.jigsaw_grid)
 
         train_records, _ = _get_split_records(self.opts)
         self.train_records = train_records
@@ -194,9 +232,14 @@ class TrainDataset(torch.utils.data.Dataset):
 
         sk_data = _load_padded_image(sk_path, self.opts.max_size)
         img_data = _load_padded_image(img_path, self.opts.max_size)
+        perm_label = random.randrange(len(self.jigsaw_permutations))
+        shuffled_sk_data = _shuffle_image_patches(
+            sk_data, self.jigsaw_grid, self.jigsaw_permutations[perm_label]
+        )
 
         sk_tensor  = self.transform(sk_data)
         img_tensor = self.transform(img_data)
+        shuffled_sk_tensor = self.transform(shuffled_sk_data)
         
         sk_aug_tensor = self.aumentation(sk_data)
         img_aug_tensor = self.aumentation(img_data)
@@ -206,6 +249,8 @@ class TrainDataset(torch.utils.data.Dataset):
             sk_tensor,
             img_aug_tensor,
             sk_aug_tensor,
+            shuffled_sk_tensor,
+            perm_label,
             self.category_to_idx[category],
             self.instance_to_idx[instance_id],
         )
